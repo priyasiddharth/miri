@@ -1832,7 +1832,17 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         mode: RetagMode,
         f: impl FnOnce(&mut InterpCx<'tcx, Self>) -> InterpResult<'tcx, T>,
     ) -> InterpResult<'tcx, T> {
-        if ecx.machine.borrow_tracker.is_some() { ecx.with_retag_mode(mode, f) } else { f(ecx) }
+        let fn_entry = matches!(mode, RetagMode::FnEntry);
+        let ret =
+            if ecx.machine.borrow_tracker.is_some() { ecx.with_retag_mode(mode, f) } else { f(ecx) };
+        if fn_entry {
+            // formal-urchin: the arguments are now in the callee's locals
+            let v = ret?;
+            formal_urchin::log_arg_variants(ecx);
+            interp_ok(v)
+        } else {
+            ret
+        }
     }
 
     fn protect_in_place_function_argument(
@@ -2187,4 +2197,79 @@ macro_rules! callback {
             _phantom: std::marker::PhantomData
         })
     }};
+}
+
+/// formal-urchin (LOGGING ONLY; changes no behaviour): after a call's
+/// arguments are passed (the fn-entry retags), log the active variant of
+/// every enum inside each argument, by argument local and field path, so
+/// that an execution certificate can record which variant the fn-entry
+/// retags walked (conformance/scripts/miri_cert.py). Any read that fails
+/// is skipped silently; nothing is written.
+mod formal_urchin {
+    use rustc_abi::{FieldIdx, Variants};
+    use rustc_middle::ty;
+
+    use crate::*;
+
+    pub fn log_arg_variants<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        let body = ecx.frame().body();
+        for local in body.args_iter() {
+            let Some(op) = ecx.local_to_op(local, None).discard_err() else { continue };
+            let mut path = String::new();
+            walk(ecx, &op, local.as_usize(), &mut path, 0);
+        }
+    }
+
+    fn walk<'tcx>(
+        ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
+        v: &OpTy<'tcx>,
+        arg: usize,
+        path: &mut String,
+        depth: usize,
+    ) {
+        if depth > 16 {
+            return;
+        }
+        let ty = v.layout.ty;
+        match ty.kind() {
+            ty::Adt(def, _) if def.is_enum() => {
+                let idx = match v.layout.variants {
+                    Variants::Single { index } => index,
+                    Variants::Multiple { .. } =>
+                        match ecx.read_discriminant(v).discard_err() {
+                            Some(i) => i,
+                            None => return,
+                        },
+                    Variants::Empty => return,
+                };
+                tracing::info!(
+                    "formal-urchin variant: arg={arg} path=[{path}] variant={} ty={ty}",
+                    idx.as_u32()
+                );
+                let Some(inner) = ecx.project_downcast(v, idx).discard_err() else { return };
+                fields(ecx, &inner, arg, path, depth);
+            }
+            ty::Adt(def, _) if def.is_box() || def.is_union() => {}
+            ty::Adt(..) | ty::Tuple(..) | ty::Array(..) => fields(ecx, v, arg, path, depth),
+            _ => {}
+        }
+    }
+
+    fn fields<'tcx>(
+        ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
+        v: &OpTy<'tcx>,
+        arg: usize,
+        path: &mut String,
+        depth: usize,
+    ) {
+        for i in 0..v.layout.fields.count() {
+            let Some(f) = ecx.project_field(v, FieldIdx::from_usize(i)).discard_err() else {
+                continue;
+            };
+            let len = path.len();
+            path.push_str(&format!(".{i}"));
+            walk(ecx, &f, arg, path, depth + 1);
+            path.truncate(len);
+        }
+    }
 }
