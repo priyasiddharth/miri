@@ -1836,13 +1836,12 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         let ret =
             if ecx.machine.borrow_tracker.is_some() { ecx.with_retag_mode(mode, f) } else { f(ecx) };
         if fn_entry {
-            // formal-urchin: the arguments are now in the callee's locals
-            let v = ret?;
+            // formal-urchin: the arguments are now in the callee's locals --
+            // also when a retag failed (UB at entry): the failing argument
+            // was copied before it was retagged; unreadable ones are skipped
             formal_urchin::log_arg_variants(ecx);
-            interp_ok(v)
-        } else {
-            ret
         }
+        ret
     }
 
     fn protect_in_place_function_argument(
