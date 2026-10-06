@@ -2205,7 +2205,7 @@ macro_rules! callback {
 /// retags walked (conformance/scripts/miri_cert.py). Any read that fails
 /// is skipped silently; nothing is written.
 mod formal_urchin {
-    use rustc_abi::{FieldIdx, Variants};
+    use rustc_abi::{FieldIdx, FieldsShape, Variants};
     use rustc_middle::ty;
 
     use crate::*;
@@ -2261,8 +2261,19 @@ mod formal_urchin {
         path: &mut String,
         depth: usize,
     ) {
-        for i in 0..v.layout.fields.count() {
-            let Some(f) = ecx.project_field(v, FieldIdx::from_usize(i)).discard_err() else {
+        let array = matches!(v.layout.fields, FieldsShape::Array { .. });
+        let n = v.layout.fields.count();
+        if array && n > 4096 {
+            // larger than any array the certificates' consumer models
+            return;
+        }
+        for i in 0..n {
+            let f = if array {
+                ecx.project_index(v, i as u64).discard_err()
+            } else {
+                ecx.project_field(v, FieldIdx::from_usize(i)).discard_err()
+            };
+            let Some(f) = f else {
                 continue;
             };
             let len = path.len();
