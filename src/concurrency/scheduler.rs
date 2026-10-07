@@ -174,7 +174,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn step_current_thread(&mut self) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        if !this.step()? {
+        // formal-urchin (observation only): the statement about to run, and
+        // the block a terminator entered (`machine::formal_urchin`)
+        crate::machine::formal_urchin::before_step(this);
+        let stepped = this.step()?;
+        crate::machine::formal_urchin::after_step(this);
+        if !stepped {
             // See if this thread can do something else.
             match this.run_on_stack_empty()? {
                 Poll::Pending => {} // keep going

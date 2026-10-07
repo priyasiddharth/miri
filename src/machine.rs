@@ -1915,6 +1915,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     }
 
     fn before_terminator(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        formal_urchin::before_terminator(ecx);
         ecx.machine.basic_block_count += 1u64; // a u64 that is only incremented by 1 will "never" overflow
         ecx.machine.since_gc += 1;
         // Possibly report our progress. This will point at the terminator we are about to execute.
@@ -1949,6 +1950,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
 
     #[inline(always)]
     fn after_stack_push(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        formal_urchin::pushed(ecx);
         if ecx.frame().extra.user_relevance >= ecx.active_thread_ref().current_user_relevance() {
             // We just pushed a frame that's at least as relevant as the so-far most relevant frame.
             // That means we are now the most relevant frame.
@@ -1959,6 +1961,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     }
 
     fn before_stack_pop(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
+        formal_urchin::popping();
         let frame = ecx.frame();
         // We want this *before* the return value copy, because the return place itself is protected
         // until we do `on_stack_pop` here, and we need to un-protect it to copy the return value.
@@ -2198,19 +2201,150 @@ macro_rules! callback {
     }};
 }
 
-/// formal-urchin (LOGGING ONLY; changes no behaviour): after a call's
-/// arguments are passed (the fn-entry retags), log the active variant of
-/// every enum inside each argument, by argument local and field path, so
-/// that an execution certificate can record which variant the fn-entry
-/// retags walked (conformance/scripts/miri_cert.py). Any read that fails
-/// is skipped silently; nothing is written.
-mod formal_urchin {
-    use rustc_abi::{FieldIdx, FieldsShape, Variants};
+/// formal-urchin (OBSERVATION ONLY; changes no behaviour). When the
+/// environment variable `FORMAL_URCHIN_EVENTS` names a file, write one JSON
+/// object per line describing the execution, from which an execution
+/// certificate is built (conformance/scripts/miri_cert.py):
+///
+///   {"e":"push","fn":F}       a frame was pushed (F: its instance, Display)
+///   {"e":"pop"}               the top frame starts popping
+///   {"e":"term","t":T}        a `switchInt`/`assert` terminator is about to
+///                             run in the top frame (T: its kind, Debug)
+///   {"e":"enter","bb":N}      a terminator ran; the top frame is now at bbN
+///   {"e":"assign","s":S}      the top frame is about to run `_N = ...` (S:
+///                             the statement kind, Debug)
+///   {"e":"variant","arg":A,"path":P,"variant":V,"ty":T}
+///                             after a call's fn-entry retags: the active
+///                             variant of an enum inside argument local A
+///
+/// Nothing here goes through the interpreter's memory accesses: branch
+/// outcomes are OBSERVED (the block entered after a terminator), never
+/// computed, and an enum's tag is read from the raw allocation bytes, so
+/// no Stacked Borrows, data-race or other machine hook sees an access.
+/// Without the variable nothing is computed or written.
+pub(crate) mod formal_urchin {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use rustc_abi::{FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants};
+    use rustc_middle::mir;
     use rustc_middle::ty;
+    use rustc_middle::ty::layout::PrimitiveExt;
 
     use crate::*;
 
+    static OUT: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    /// a terminator ran in the current `step` (set before it runs)
+    static TERMINATOR: AtomicBool = AtomicBool::new(false);
+
+    fn out() -> Option<&'static Mutex<File>> {
+        OUT.get_or_init(|| {
+            std::env::var_os("FORMAL_URCHIN_EVENTS")
+                .and_then(|p| File::create(p).ok())
+                .map(Mutex::new)
+        })
+        .as_ref()
+    }
+
+    fn on() -> bool {
+        out().is_some()
+    }
+
+    /// Written unbuffered, one line at a time: Miri may end the process
+    /// with `exit` (UB, panics), which would lose a buffer.
+    fn emit(line: String) {
+        if let Some(m) = out() {
+            let mut f = m.lock().unwrap();
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    fn json(s: &str) -> String {
+        let mut o = String::with_capacity(s.len() + 2);
+        o.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => o.push_str("\\\""),
+                '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"),
+                '\r' => o.push_str("\\r"),
+                '\t' => o.push_str("\\t"),
+                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                c => o.push(c),
+            }
+        }
+        o.push('"');
+        o
+    }
+
+    pub fn pushed<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        if on() {
+            emit(format!("{{\"e\":\"push\",\"fn\":{}}}\n", json(&ecx.frame().instance().to_string())));
+        }
+    }
+
+    pub fn popping() {
+        if on() {
+            emit("{\"e\":\"pop\"}\n".to_string());
+        }
+    }
+
+    pub fn before_terminator<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        if !on() {
+            return;
+        }
+        TERMINATOR.store(true, Ordering::Relaxed);
+        let Either::Left(loc) = ecx.frame().current_loc() else { return };
+        let term = ecx.body().basic_blocks[loc.block].terminator();
+        if matches!(
+            term.kind,
+            mir::TerminatorKind::SwitchInt { .. } | mir::TerminatorKind::Assert { .. }
+        ) {
+            emit(format!("{{\"e\":\"term\",\"t\":{}}}\n", json(&format!("{:?}", term.kind))));
+        }
+    }
+
+    /// Before `step`: the statement it is about to run, when it assigns a
+    /// bare local.
+    pub fn before_step<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        if !on() || ecx.active_thread_stack().is_empty() {
+            return;
+        }
+        TERMINATOR.store(false, Ordering::Relaxed);
+        let Either::Left(loc) = ecx.frame().current_loc() else { return };
+        let Some(stmt) = ecx.body().basic_blocks[loc.block].statements.get(loc.statement_index)
+        else {
+            return;
+        };
+        if let mir::StatementKind::Assign(assign) = &stmt.kind
+            && assign.0.as_local().is_some()
+        {
+            emit(format!("{{\"e\":\"assign\",\"s\":{}}}\n", json(&format!("{:?}", stmt.kind))));
+        }
+    }
+
+    /// After `step`: if it ran a terminator, the block the top frame entered.
+    pub fn after_step<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        if !on() || !TERMINATOR.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if ecx.active_thread_stack().is_empty() {
+            return;
+        }
+        if let Either::Left(loc) = ecx.frame().current_loc() {
+            emit(format!("{{\"e\":\"enter\",\"bb\":{}}}\n", loc.block.as_usize()));
+        }
+    }
+
+    /// After a call's arguments are passed (the fn-entry retags): the active
+    /// variant of every enum inside each argument, by argument local and
+    /// field path. Unreadable values are skipped.
     pub fn log_arg_variants<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
+        if !on() {
+            return;
+        }
         let body = ecx.frame().body();
         for local in body.args_iter() {
             let Some(op) = ecx.local_to_op(local, None).discard_err() else { continue };
@@ -2232,19 +2366,13 @@ mod formal_urchin {
         let ty = v.layout.ty;
         match ty.kind() {
             ty::Adt(def, _) if def.is_enum() => {
-                let idx = match v.layout.variants {
-                    Variants::Single { index } => index,
-                    Variants::Multiple { .. } =>
-                        match ecx.read_discriminant(v).discard_err() {
-                            Some(i) => i,
-                            None => return,
-                        },
-                    Variants::Empty => return,
-                };
-                tracing::info!(
-                    "formal-urchin variant: arg={arg} path=[{path}] variant={} ty={ty}",
-                    idx.as_u32()
-                );
+                let Some(idx) = raw_variant(ecx, v) else { return };
+                emit(format!(
+                    "{{\"e\":\"variant\",\"arg\":{arg},\"path\":{},\"variant\":{},\"ty\":{}}}\n",
+                    json(&path),
+                    idx.as_u32(),
+                    json(&ty.to_string())
+                ));
                 let Some(inner) = ecx.project_downcast(v, idx).discard_err() else { return };
                 fields(ecx, &inner, arg, path, depth);
             }
@@ -2281,5 +2409,88 @@ mod formal_urchin {
             walk(ecx, &f, arg, path, depth + 1);
             path.truncate(len);
         }
+    }
+
+    /// The bits of an integer-or-pointer field, read without a machine hook:
+    /// from the frame's immediate, or from the raw allocation bytes (a
+    /// pointer's bits are its address). `None` if uninitialised.
+    fn raw_bits<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>, f: &OpTy<'tcx>) -> Option<u128> {
+        let size = f.layout.size;
+        let s = match f.as_mplace_or_imm() {
+            Either::Left(mp) => {
+                let (alloc_id, offset, _) =
+                    ecx.ptr_try_get_alloc_id(mp.ptr(), size.bytes().try_into().ok()?).ok()?;
+                let alloc = ecx.get_alloc_raw(alloc_id).discard_err()?;
+                alloc.read_scalar(ecx, alloc_range(offset, size), false).ok()?
+            }
+            Either::Right(imm) =>
+                match *imm {
+                    Immediate::Scalar(s) => s,
+                    _ => return None,
+                },
+        };
+        match s {
+            Scalar::Int(i) if i.size() == size => Some(i.to_bits(size)),
+            Scalar::Int(_) => None,
+            Scalar::Ptr(p, _) => Some(u128::from(p.into_raw_parts().1.bytes())),
+        }
+    }
+
+    /// The variant an enum value holds, decoded as `read_discriminant` does
+    /// but from `raw_bits` (no machine hook). `None` where
+    /// `read_discriminant` would fail.
+    fn raw_variant<'tcx>(
+        ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
+        v: &OpTy<'tcx>,
+    ) -> Option<VariantIdx> {
+        let layout = v.layout;
+        let ty = layout.ty;
+        let idx = match layout.variants {
+            Variants::Empty => return None,
+            Variants::Single { index } => index,
+            Variants::Multiple { tag, ref tag_encoding, tag_field, .. } => {
+                let tag_layout = ecx.layout_of(tag.primitive().to_int_ty(*ecx.tcx)).ok()?;
+                let tag_size: Size = tag_layout.size;
+                let bits = raw_bits(ecx, &ecx.project_field(v, tag_field).discard_err()?)?;
+                let valid = tag.valid_range(ecx);
+                match *tag_encoding {
+                    TagEncoding::Direct => {
+                        if !valid.contains(bits) {
+                            return None;
+                        }
+                        let discr_layout = ecx.layout_of(ty.discriminant_ty(*ecx.tcx)).ok()?;
+                        let wide = if tag_layout.backend_repr.is_signed() {
+                            tag_size.sign_extend(bits) as u128
+                        } else {
+                            bits
+                        };
+                        let discr_bits = discr_layout.size.truncate(wide);
+                        let ty::Adt(adt, _) = ty.kind() else { return None };
+                        adt.discriminants(*ecx.tcx).find(|(_, d)| d.val == discr_bits)?.0
+                    }
+                    TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start } => {
+                        let start = niche_variants.start.as_u32();
+                        let last = niche_variants.last.as_u32();
+                        let rel = tag_size.truncate(bits.wrapping_sub(niche_start));
+                        if rel <= u128::from(last - start) {
+                            let i = VariantIdx::from_u32(start + u32::try_from(rel).ok()?);
+                            if i == untagged_variant {
+                                return None;
+                            }
+                            i
+                        } else {
+                            if !valid.contains(bits) {
+                                return None;
+                            }
+                            untagged_variant
+                        }
+                    }
+                }
+            }
+        };
+        if layout.for_variant(ecx, idx).is_uninhabited() {
+            return None;
+        }
+        Some(idx)
     }
 }
