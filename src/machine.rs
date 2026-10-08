@@ -2206,7 +2206,9 @@ macro_rules! callback {
 /// object per line describing the execution, from which an execution
 /// certificate is built (conformance/scripts/miri_cert.py):
 ///
-///   {"e":"push","fn":F}       a frame was pushed (F: its instance, Display)
+///   {"e":"push","fn":F,"local":L,"item":I,"kind":K}
+///                             a frame was pushed (F: its instance,
+///                             Display; L/I/K: see `pushed`)
 ///   {"e":"pop"}               the top frame starts popping
 ///   {"e":"term","t":T}        a `switchInt`/`assert` terminator is about to
 ///                             run in the top frame (T: its kind, Debug)
@@ -2279,9 +2281,21 @@ pub(crate) mod formal_urchin {
         o
     }
 
+    /// `local`: the function's code is the program's own (its definition
+    /// is in the local crate), `item`: the frame runs that definition's
+    /// body itself (not a compiler shim built for it), `kind`: its
+    /// `DefKind` (`Fn`, `AssocFn`, `Closure`, ...).
     pub fn pushed<'tcx>(ecx: &InterpCx<'tcx, MiriMachine<'tcx>>) {
         if on() {
-            emit(format!("{{\"e\":\"push\",\"fn\":{}}}\n", json(&ecx.frame().instance().to_string())));
+            let inst = ecx.frame().instance();
+            let def_id = inst.def_id();
+            emit(format!(
+                "{{\"e\":\"push\",\"fn\":{},\"local\":{},\"item\":{},\"kind\":{}}}\n",
+                json(&inst.to_string()),
+                def_id.is_local(),
+                matches!(inst.def, ty::InstanceKind::Item(_)),
+                json(&format!("{:?}", ecx.tcx.def_kind(def_id)))
+            ));
         }
     }
 
